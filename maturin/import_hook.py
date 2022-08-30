@@ -61,6 +61,12 @@ class Loader(abc.Loader):
     def __init__(self, fullname):
         self.fullname = fullname
 
+    def create_module(self, spec):
+        return importlib.import_module(spec.name)
+
+    def exec_module(self, module) -> None:
+        pass
+
     def load_module(self, fullname):
         return importlib.import_module(self.fullname)
 
