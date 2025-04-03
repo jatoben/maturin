@@ -200,6 +200,13 @@ pub struct DevelopOptions {
         action = clap::ArgAction::Append
     )]
     pub extras: Vec<String>,
+    /// Skip extra environment checks; run as fast as possible.
+    ///
+    /// Assumes a standard pip environment. Incompatible with
+    /// uv and editable installations. If possible, pass `--target`
+    /// as well, to avoid an extra `python` shell invocation.
+    #[arg(long)]
+    pub fast: bool,
     /// Skip installation, only build the extension module inplace
     ///
     /// Only works with mixed Rust/Python project layout
@@ -322,6 +329,10 @@ fn configure_as_editable(
     python: &Path,
     install_backend: &InstallBackend,
 ) -> Result<()> {
+    if !build_context.editable {
+        return Ok(());
+    }
+
     println!("✏️ Setting installed package as editable");
     install_backend.check_supports_show_files(python)?;
     let mut cmd = install_backend.make_command(python);
@@ -371,11 +382,16 @@ pub fn develop(develop_options: DevelopOptions, venv_dir: &Path) -> Result<()> {
         release,
         strip,
         extras,
+        fast,
         skip_install,
         pip_path,
         cargo_options,
         uv,
     } = develop_options;
+    if fast && uv {
+        bail!("Sorry, `--fast` is incompatible with uv");
+    }
+
     let mut target_triple = cargo_options.target.as_ref().map(|x| x.to_string());
     let target = Target::from_target_triple(cargo_options.target)?;
     let python = target.get_venv_python(venv_dir);
@@ -406,11 +422,12 @@ pub fn develop(develop_options: DevelopOptions, venv_dir: &Path) -> Result<()> {
         },
     };
 
+    let editable = !fast;
     let build_context = build_options
         .into_build_context()
         .release(release)
         .strip(strip)
-        .editable(true)
+        .editable(editable)
         .build()?;
 
     // Ensure that version information is present, https://github.com/PyO3/maturin/issues/2416
@@ -428,22 +445,28 @@ pub fn develop(develop_options: DevelopOptions, venv_dir: &Path) -> Result<()> {
             || anyhow!("Expected `python` to be a python interpreter inside a virtualenv ಠ_ಠ"),
         )?;
 
-    let uv_venv = is_uv_venv(venv_dir);
-    let uv_info = if uv || uv_venv {
-        match find_uv_python(&interpreter.executable).or_else(|_| find_uv_bin()) {
-            Ok(uv_info) => Some(Ok(uv_info)),
-            Err(e) => {
-                if uv {
-                    Some(Err(e))
-                } else {
-                    // Ignore error and try pip instead if it's a uv venv but `--uv` is not specified
-                    None
+    let uv_info = if fast {
+        None
+    } else {
+        let uv_venv = is_uv_venv(venv_dir);
+
+        if uv || uv_venv {
+            match find_uv_python(&interpreter.executable).or_else(|_| find_uv_bin()) {
+                Ok(uv_info) => Some(Ok(uv_info)),
+                Err(e) => {
+                    if uv {
+                        Some(Err(e))
+                    } else {
+                        // Ignore error and try pip instead if it's a uv venv but `--uv` is not specified
+                        None
+                    }
                 }
             }
+        } else {
+            None
         }
-    } else {
-        None
     };
+
     let install_backend = if let Some(uv_info) = uv_info {
         let (uv_path, uv_args) = uv_info?;
         InstallBackend::Uv {
@@ -451,14 +474,17 @@ pub fn develop(develop_options: DevelopOptions, venv_dir: &Path) -> Result<()> {
             args: uv_args,
         }
     } else {
-        check_pip_exists(&interpreter.executable, pip_path.as_ref())
-            .context("Failed to find pip (if working with a uv venv try `maturin develop --uv`)")?;
+        if !fast {
+            check_pip_exists(&interpreter.executable, pip_path.as_ref()).context(
+                "Failed to find pip (if working with a uv venv try `maturin develop --uv`)",
+            )?;
+        }
         InstallBackend::Pip {
             path: pip_path.clone(),
         }
     };
 
-    if !skip_install {
+    if !fast || !skip_install {
         install_dependencies(&build_context, &extras, &python, venv_dir, &install_backend)?;
     }
 
